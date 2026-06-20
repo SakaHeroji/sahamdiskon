@@ -212,23 +212,13 @@ st.title("SahamDiskon")
 st.caption("Valuasi fundamental dan optimasi portofolio IDX dalam satu alur.")
 
 with st.sidebar:
-    st.header("Input")
-    ticker_text = st.text_area("Ticker IDX", value=DEFAULT_TICKERS, height=140)
-    regime = st.selectbox("Regime valuasi", ["conservative", "balanced", "aggressive"], index=0)
-    run_valuation = st.button("Jalankan Valuasi", type="primary", use_container_width=True)
+    st.header("Status")
+    cached_valuation = st.session_state.get("valuation_df", pd.DataFrame())
+    cached_portfolio = st.session_state.get("portfolio_results")
+    st.metric("Hasil valuasi", 0 if cached_valuation.empty else len(cached_valuation))
+    st.metric("Hasil optimasi", 0 if not cached_portfolio else len(cached_portfolio))
 
     st.divider()
-    st.header("Optimasi")
-    candidate_filter = st.selectbox("Kandidat", ["SEMUA", "SANGAT MURAH", "MURAH", "WAJAR"], index=0)
-    profile = st.selectbox("Profil risiko", ["MODERATE", "SAFE", "AGGRESSIVE"], index=0)
-    hist_period = st.selectbox("Histori harga", ["6mo", "1y", "2y", "5y"], index=1)
-    algorithms = st.multiselect("Algoritma", ["DE", "PSO", "SA"], default=["DE", "PSO"])
-    pop_size = st.slider("Populasi", min_value=30, max_value=200, value=80, step=10)
-    max_iter = st.slider("Iterasi", min_value=50, max_value=500, value=150, step=25)
-    capital = st.number_input("Modal simulasi", min_value=1_000_000, value=100_000_000, step=1_000_000)
-    seed = st.number_input("Seed optimizer", min_value=1, max_value=9999, value=42)
-    run_optimizer = st.button("Jalankan Optimasi", use_container_width=True)
-
     if st.button("Clear cache data", use_container_width=True):
         st.cache_data.clear()
         st.session_state.pop("valuation_df", None)
@@ -238,32 +228,81 @@ with st.sidebar:
 
 tab_valuation, tab_optimizer = st.tabs(["Valuasi", "Optimasi Portofolio"])
 
-if run_valuation:
-    tickers = parse_tickers(ticker_text)
-    if not tickers:
-        st.warning("Masukkan minimal satu ticker.")
-    else:
-        records = []
-        progress = st.progress(0)
-        status = st.empty()
-        for idx, ticker in enumerate(tickers, 1):
-            status.write(f"Menganalisis {ticker} ({idx}/{len(tickers)})")
-            records.append(analyze_single_stock(ticker, regime))
-            progress.progress(idx / len(tickers))
-        status.empty()
-        progress.empty()
-        st.session_state["valuation_df"] = build_valuation_frame(records)
-        st.session_state.pop("portfolio_results", None)
-
-valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
-
 with tab_valuation:
+    st.subheader("Form Valuasi")
+    with st.form("valuation_form", clear_on_submit=False):
+        action_cols = st.columns([1, 2])
+        with action_cols[0]:
+            run_valuation = st.form_submit_button("Jalankan Valuasi", type="primary", use_container_width=True)
+        with action_cols[1]:
+            st.caption("Analisis fundamental berjalan dari daftar ticker di bawah, lalu hasilnya dipakai otomatis sebagai kandidat optimasi.")
+
+        input_cols = st.columns([2, 1])
+        with input_cols[0]:
+            ticker_text = st.text_area(
+                "Ticker IDX",
+                value=DEFAULT_TICKERS,
+                height=140,
+                help="Pisahkan ticker dengan koma, spasi, titik koma, atau baris baru.",
+            )
+        with input_cols[1]:
+            regime = st.selectbox("Regime valuasi", ["conservative", "balanced", "aggressive"], index=0)
+
+    if run_valuation:
+        tickers = parse_tickers(ticker_text)
+        if not tickers:
+            st.warning("Masukkan minimal satu ticker.")
+        else:
+            records = []
+            progress = st.progress(0)
+            status = st.empty()
+            for idx, ticker in enumerate(tickers, 1):
+                status.write(f"Menganalisis {ticker} ({idx}/{len(tickers)})")
+                records.append(analyze_single_stock(ticker, regime))
+                progress.progress(idx / len(tickers))
+            status.empty()
+            progress.empty()
+            st.session_state["valuation_df"] = build_valuation_frame(records)
+            st.session_state.pop("portfolio_results", None)
+
+    valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
+    st.divider()
     show_valuation(valuation_df)
 
 with tab_optimizer:
+    st.subheader("Form Optimasi")
+    valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
+
     if valuation_df.empty:
         st.info("Jalankan valuasi dulu untuk membuat kandidat portofolio.")
     else:
+        with st.form("optimizer_form", clear_on_submit=False):
+            action_cols = st.columns([1, 2])
+            with action_cols[0]:
+                run_optimizer = st.form_submit_button("Jalankan Optimasi", type="primary", use_container_width=True)
+            with action_cols[1]:
+                st.caption("Optimasi memakai hasil valuasi yang valid, mengambil histori harga, lalu membandingkan algoritma portofolio.")
+
+            filter_cols = st.columns(4)
+            with filter_cols[0]:
+                candidate_filter = st.selectbox("Kandidat", ["SEMUA", "SANGAT MURAH", "MURAH", "WAJAR"], index=0)
+            with filter_cols[1]:
+                profile = st.selectbox("Profil risiko", ["MODERATE", "SAFE", "AGGRESSIVE"], index=0)
+            with filter_cols[2]:
+                hist_period = st.selectbox("Histori harga", ["6mo", "1y", "2y", "5y"], index=1)
+            with filter_cols[3]:
+                capital = st.number_input("Modal simulasi", min_value=1_000_000, value=100_000_000, step=1_000_000)
+
+            algo_cols = st.columns([2, 1, 1, 1])
+            with algo_cols[0]:
+                algorithms = st.multiselect("Algoritma", ["DE", "PSO", "SA"], default=["DE", "PSO"])
+            with algo_cols[1]:
+                pop_size = st.slider("Populasi", min_value=30, max_value=200, value=80, step=10)
+            with algo_cols[2]:
+                max_iter = st.slider("Iterasi", min_value=50, max_value=500, value=150, step=25)
+            with algo_cols[3]:
+                seed = st.number_input("Seed optimizer", min_value=1, max_value=9999, value=42)
+
         valid_df = valuation_df[valuation_df["Error"].isna()].copy()
         tickers, val_data, candidate_df = optimizer.load_valuation_dataframe(
             valid_df,
