@@ -38,6 +38,10 @@ RISK_FREE_RATE = 0.065
 TRADING_DAYS = 252
 PORTFOLIO_SIZE = 5
 HIST_PERIOD = "1y"
+HIST_PERIOD_DOWNLOAD_PERIODS = {
+    "3y": "5y",
+    "4y": "5y",
+}
 
 # Optimizer params
 POP_SIZE = 200
@@ -46,6 +50,39 @@ MIN_WEIGHT = 0.05
 MAX_WEIGHT = 0.50
 
 CSV_FILE = "stock_valuation_results.csv"
+
+
+def _history_download_period(hist_period: str) -> str:
+    period = str(hist_period or HIST_PERIOD).strip().lower()
+    return HIST_PERIOD_DOWNLOAD_PERIODS.get(period, period)
+
+
+def _trim_history_to_period(hist: pd.DataFrame, hist_period: str) -> pd.DataFrame:
+    period = str(hist_period or HIST_PERIOD).strip().lower()
+    if hist.empty or not isinstance(hist.index, pd.DatetimeIndex):
+        return hist
+
+    try:
+        if period.endswith("mo"):
+            start = hist.index.max() - pd.DateOffset(months=int(period[:-2]))
+        elif period.endswith("y"):
+            start = hist.index.max() - pd.DateOffset(years=int(period[:-1]))
+        else:
+            return hist
+    except (TypeError, ValueError):
+        return hist
+
+    return hist[hist.index >= start]
+
+
+def _download_price_history(ticker_obj, hist_period: str) -> pd.DataFrame:
+    hist = ticker_obj.history(period=_history_download_period(hist_period))
+    return _trim_history_to_period(hist, hist_period)
+
+
+def load_price_history(ticker: str, hist_period: str = HIST_PERIOD) -> pd.DataFrame:
+    jk = ticker if ticker.endswith(".JK") else f"{ticker}.JK"
+    return _download_price_history(yf.Ticker(jk), hist_period)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -234,7 +271,7 @@ def fetch_stock(
     jk = ticker if ticker.endswith(".JK") else f"{ticker}.JK"
     try:
         tk = yf.Ticker(jk)
-        hist = tk.history(period=hist_period)
+        hist = _download_price_history(tk, hist_period)
         if hist.empty or len(hist) < 60:
             return None
 

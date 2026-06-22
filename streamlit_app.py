@@ -20,6 +20,20 @@ st.set_page_config(page_title="SahamDiskon", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TICKERS = "BBCA, BBRI, BMRI, TLKM, ASII, ICBP, UNTR, INDF, KLBF, ADRO, ANTM, MDKA"
+DEFAULT_SINGLE_TICKER = "BBCA"
+ANALYSIS_TYPES = ["Individual", "Portfolio"]
+REGIMES = ["conservative", "balanced", "aggressive"]
+HIST_PERIODS = ["6mo", "1y", "2y", "3y", "4y", "5y"]
+HIST_PERIOD_LABELS = {
+    "6mo": "6 bulan",
+    "1y": "1 tahun",
+    "2y": "2 tahun",
+    "3y": "3 tahun",
+    "4y": "4 tahun",
+    "5y": "5 tahun",
+}
+INDIVIDUAL_DATA_SCOPES = ["Saham tunggal", "Watchlist default", "Daftar ticker custom"]
+PORTFOLIO_DATA_SCOPES = ["Watchlist default", "Daftar ticker custom"]
 
 
 def load_optimizer_module():
@@ -57,6 +71,10 @@ def clean_number(value):
     except (TypeError, ValueError):
         pass
     return None
+
+
+def format_hist_period(period: str) -> str:
+    return HIST_PERIOD_LABELS.get(period, period)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -124,6 +142,31 @@ def collect_stock_history(tickers: List[str], val_data: Dict[str, dict], hist_pe
     status.empty()
     progress.empty()
     return stocks
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def load_close_history(tickers: List[str], hist_period: str) -> pd.DataFrame:
+    frames = []
+
+    for ticker in tickers:
+        try:
+            hist = optimizer.load_price_history(ticker, hist_period)
+        except Exception:
+            continue
+
+        if hist.empty or "Close" not in hist.columns:
+            continue
+
+        clean_ticker = ticker.replace(".JK", "")
+        frames.append(hist["Close"].dropna().rename(clean_ticker))
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=1).sort_index()
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_convert(None)
+    return df
 
 
 def idr(value: float) -> str:
@@ -208,139 +251,319 @@ def show_portfolio(result, all_results, capital: float):
     st.caption(f"Modal simulasi: {idr(capital)} | Terpakai: {idr(invested)} | Expected profit: {idr(expected_profit)} | Risiko drawdown: {idr(max_risk)}")
 
 
-st.title("SahamDiskon")
-st.caption("Valuasi fundamental dan optimasi portofolio IDX dalam satu alur.")
-
-with st.sidebar:
-    st.header("Status")
-    cached_valuation = st.session_state.get("valuation_df", pd.DataFrame())
-    cached_portfolio = st.session_state.get("portfolio_results")
-    st.metric("Hasil valuasi", 0 if cached_valuation.empty else len(cached_valuation))
-    st.metric("Hasil optimasi", 0 if not cached_portfolio else len(cached_portfolio))
-
-    st.divider()
-    if st.button("Clear cache data", use_container_width=True):
-        st.cache_data.clear()
-        st.session_state.pop("valuation_df", None)
-        st.session_state.pop("portfolio_results", None)
-        st.rerun()
+def analysis_page_name(analysis_type=None) -> str:
+    selected = analysis_type or st.session_state.get("analysis_type", "Individual")
+    return "Analisis Portofolio" if selected == "Portfolio" else "Analisis Individual"
 
 
-tab_valuation, tab_optimizer = st.tabs(["Valuasi", "Optimasi Portofolio"])
+def extract_valuation_data(tickers: List[str], regime: str) -> pd.DataFrame:
+    records = []
+    progress = st.progress(0)
+    status = st.empty()
 
-with tab_valuation:
-    st.subheader("Form Valuasi")
-    with st.form("valuation_form", clear_on_submit=False):
-        action_cols = st.columns([1, 2])
-        with action_cols[0]:
-            run_valuation = st.form_submit_button("Jalankan Valuasi", type="primary", use_container_width=True)
-        with action_cols[1]:
-            st.caption("Analisis fundamental berjalan dari daftar ticker di bawah, lalu hasilnya dipakai otomatis sebagai kandidat optimasi.")
+    for idx, ticker in enumerate(tickers, 1):
+        status.write(f"Mengekstrak dan menganalisis {ticker} ({idx}/{len(tickers)})")
+        records.append(analyze_single_stock(ticker, regime))
+        progress.progress(idx / len(tickers))
 
-        input_cols = st.columns([2, 1])
-        with input_cols[0]:
-            ticker_text = st.text_area(
+    status.empty()
+    progress.empty()
+    return build_valuation_frame(records)
+
+
+def ticker_text_for_scope(data_scope: str, single_ticker: str, custom_tickers: str) -> str:
+    if data_scope == "Saham tunggal":
+        return single_ticker
+    if data_scope == "Watchlist default":
+        return DEFAULT_TICKERS
+    return custom_tickers
+
+
+def show_extraction_summary():
+    config = st.session_state.get("extraction_config")
+    if not config:
+        return
+
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("Tipe analisis", config["analysis_type"])
+    summary_cols[1].metric("Cakupan data", config["data_scope"])
+    summary_cols[2].metric("Jumlah ticker", config["ticker_count"])
+    summary_cols[3].metric("Regime", config["regime"])
+    summary_cols[4].metric("Histori harga", format_hist_period(config.get("hist_period", "1y")))
+
+
+def show_extraction_page():
+    st.subheader("Ekstraksi Data")
+
+    current_type = st.session_state.get("analysis_type", "Individual")
+    type_index = ANALYSIS_TYPES.index(current_type) if current_type in ANALYSIS_TYPES else 0
+    analysis_type = st.radio(
+        "Tipe analisis",
+        ANALYSIS_TYPES,
+        index=type_index,
+        horizontal=True,
+        key="analysis_type_selector",
+    )
+
+    scope_options = PORTFOLIO_DATA_SCOPES if analysis_type == "Portfolio" else INDIVIDUAL_DATA_SCOPES
+    previous_scope = st.session_state.get("data_scope", scope_options[0])
+    scope_index = scope_options.index(previous_scope) if previous_scope in scope_options else 0
+
+    setup_cols = st.columns(3)
+    with setup_cols[0]:
+        data_scope = st.selectbox("Cakupan data", scope_options, index=scope_index, key="data_scope_selector")
+    with setup_cols[1]:
+        regime = st.selectbox("Regime valuasi", REGIMES, index=0, key="regime_selector")
+    with setup_cols[2]:
+        default_hist = st.session_state.get("hist_period", "1y")
+        hist_index = HIST_PERIODS.index(default_hist) if default_hist in HIST_PERIODS else 1
+        hist_period = st.selectbox(
+            "Cakupan histori harga",
+            HIST_PERIODS,
+            index=hist_index,
+            format_func=format_hist_period,
+            key="hist_period_selector",
+        )
+
+    with st.form("extraction_form", clear_on_submit=False):
+        if data_scope == "Saham tunggal":
+            single_ticker = st.text_input("Ticker IDX", value=DEFAULT_SINGLE_TICKER, key="single_ticker_input")
+            custom_tickers = st.session_state.get("custom_ticker_text", DEFAULT_TICKERS)
+        elif data_scope == "Watchlist default":
+            single_ticker = st.session_state.get("single_ticker_input", DEFAULT_SINGLE_TICKER)
+            custom_tickers = st.text_area(
                 "Ticker IDX",
                 value=DEFAULT_TICKERS,
                 height=140,
+                disabled=True,
+                help="Watchlist bawaan untuk cakupan awal.",
+            )
+        else:
+            single_ticker = st.session_state.get("single_ticker_input", DEFAULT_SINGLE_TICKER)
+            custom_tickers = st.text_area(
+                "Ticker IDX",
+                value=st.session_state.get("custom_ticker_text", DEFAULT_TICKERS),
+                height=140,
+                key="custom_ticker_text",
                 help="Pisahkan ticker dengan koma, spasi, titik koma, atau baris baru.",
             )
-        with input_cols[1]:
-            regime = st.selectbox("Regime valuasi", ["conservative", "balanced", "aggressive"], index=0)
 
-    if run_valuation:
-        tickers = parse_tickers(ticker_text)
-        if not tickers:
-            st.warning("Masukkan minimal satu ticker.")
-        else:
-            records = []
-            progress = st.progress(0)
-            status = st.empty()
-            for idx, ticker in enumerate(tickers, 1):
-                status.write(f"Menganalisis {ticker} ({idx}/{len(tickers)})")
-                records.append(analyze_single_stock(ticker, regime))
-                progress.progress(idx / len(tickers))
-            status.empty()
-            progress.empty()
-            st.session_state["valuation_df"] = build_valuation_frame(records)
-            st.session_state.pop("portfolio_results", None)
+        submitted = st.form_submit_button("Ekstrak Data", type="primary", use_container_width=True)
 
-    valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
-    st.divider()
-    show_valuation(valuation_df)
+    if not submitted:
+        return
 
-with tab_optimizer:
-    st.subheader("Form Optimasi")
+    ticker_text = ticker_text_for_scope(data_scope, single_ticker, custom_tickers)
+    tickers = parse_tickers(ticker_text)
+
+    if not tickers:
+        st.warning("Masukkan minimal satu ticker.")
+        return
+    if analysis_type == "Portfolio" and len(tickers) < optimizer.PORTFOLIO_SIZE:
+        st.warning(f"Analisis portofolio butuh minimal {optimizer.PORTFOLIO_SIZE} ticker kandidat.")
+        return
+
+    valuation_df = extract_valuation_data(tickers, regime)
+    st.session_state["valuation_df"] = valuation_df
+    st.session_state.pop("portfolio_results", None)
+    st.session_state["analysis_type"] = analysis_type
+    st.session_state["data_scope"] = data_scope
+    st.session_state["hist_period"] = hist_period
+    st.session_state["extraction_config"] = {
+        "analysis_type": analysis_type,
+        "data_scope": data_scope,
+        "ticker_count": len(tickers),
+        "tickers": tickers,
+        "regime": regime,
+        "hist_period": hist_period,
+        "extracted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    st.session_state["active_page"] = analysis_page_name(analysis_type)
+    st.rerun()
+
+
+def show_individual_price_history(valuation_df: pd.DataFrame):
+    config = st.session_state.get("extraction_config", {})
+    hist_period = config.get("hist_period", st.session_state.get("hist_period", "1y"))
+    tickers = config.get("tickers") or valuation_df["Ticker"].dropna().astype(str).tolist()
+
+    if not tickers:
+        return
+
+    st.caption(f"Histori harga: {format_hist_period(hist_period)}")
+    with st.spinner("Mengambil histori harga..."):
+        price_df = load_close_history(tickers, hist_period)
+
+    price_df = price_df.ffill().dropna(axis=1, how="all")
+    if price_df.empty:
+        st.warning("Histori harga tidak tersedia untuk cakupan yang dipilih.")
+        return
+
+    st.line_chart(price_df)
+
+
+def show_individual_page():
+    st.subheader("Analisis Individual")
     valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
 
     if valuation_df.empty:
-        st.info("Jalankan valuasi dulu untuk membuat kandidat portofolio.")
-    else:
-        with st.form("optimizer_form", clear_on_submit=False):
-            action_cols = st.columns([1, 2])
-            with action_cols[0]:
-                run_optimizer = st.form_submit_button("Jalankan Optimasi", type="primary", use_container_width=True)
-            with action_cols[1]:
-                st.caption("Optimasi memakai hasil valuasi yang valid, mengambil histori harga, lalu membandingkan algoritma portofolio.")
+        st.info("Mulai dari page Ekstraksi Data untuk memilih cakupan saham.")
+        return
 
-            filter_cols = st.columns(4)
-            with filter_cols[0]:
-                candidate_filter = st.selectbox("Kandidat", ["SEMUA", "SANGAT MURAH", "MURAH", "WAJAR"], index=0)
-            with filter_cols[1]:
-                profile = st.selectbox("Profil risiko", ["MODERATE", "SAFE", "AGGRESSIVE"], index=0)
-            with filter_cols[2]:
-                hist_period = st.selectbox("Histori harga", ["6mo", "1y", "2y", "5y"], index=1)
-            with filter_cols[3]:
-                capital = st.number_input("Modal simulasi", min_value=1_000_000, value=100_000_000, step=1_000_000)
+    show_extraction_summary()
+    st.divider()
+    show_individual_price_history(valuation_df)
+    st.divider()
+    show_valuation(valuation_df)
 
-            algo_cols = st.columns([2, 1, 1, 1])
-            with algo_cols[0]:
-                algorithms = st.multiselect("Algoritma", ["DE", "PSO", "SA"], default=["DE", "PSO"])
-            with algo_cols[1]:
-                pop_size = st.slider("Populasi", min_value=30, max_value=200, value=80, step=10)
-            with algo_cols[2]:
-                max_iter = st.slider("Iterasi", min_value=50, max_value=500, value=150, step=25)
-            with algo_cols[3]:
-                seed = st.number_input("Seed optimizer", min_value=1, max_value=9999, value=42)
 
-        valid_df = valuation_df[valuation_df["Error"].isna()].copy()
-        tickers, val_data, candidate_df = optimizer.load_valuation_dataframe(
-            valid_df,
-            status_filter=candidate_filter,
-            top_n=25,
-        )
+def show_portfolio_page():
+    st.subheader("Analisis Portofolio")
+    valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
 
-        st.caption(f"Kandidat optimizer: {len(tickers)} saham")
-        st.dataframe(candidate_df, use_container_width=True, hide_index=True)
+    if valuation_df.empty:
+        st.info("Mulai dari page Ekstraksi Data untuk membuat kandidat portofolio.")
+        return
 
-        if run_optimizer:
-            if not algorithms:
-                st.warning("Pilih minimal satu algoritma.")
-            elif len(tickers) < optimizer.PORTFOLIO_SIZE:
-                st.warning(f"Butuh minimal {optimizer.PORTFOLIO_SIZE} kandidat, saat ini hanya {len(tickers)}.")
+    show_extraction_summary()
+    st.divider()
+
+    with st.form("optimizer_form", clear_on_submit=False):
+        action_cols = st.columns([1, 2])
+        with action_cols[0]:
+            run_optimizer = st.form_submit_button("Jalankan Optimasi", type="primary", use_container_width=True)
+        with action_cols[1]:
+            st.caption("Optimasi memakai hasil ekstraksi yang valid, mengambil histori harga, lalu membandingkan algoritma portofolio.")
+
+        filter_cols = st.columns(4)
+        with filter_cols[0]:
+            candidate_filter = st.selectbox("Kandidat", ["SEMUA", "SANGAT MURAH", "MURAH", "WAJAR"], index=0)
+        with filter_cols[1]:
+            profile = st.selectbox("Profil risiko", ["MODERATE", "SAFE", "AGGRESSIVE"], index=0)
+        with filter_cols[2]:
+            default_hist = st.session_state.get("hist_period", "1y")
+            hist_index = HIST_PERIODS.index(default_hist) if default_hist in HIST_PERIODS else 1
+            hist_period = st.selectbox(
+                "Histori harga",
+                HIST_PERIODS,
+                index=hist_index,
+                format_func=format_hist_period,
+            )
+        with filter_cols[3]:
+            capital = st.number_input("Modal simulasi", min_value=1_000_000, value=100_000_000, step=1_000_000)
+
+        algo_cols = st.columns([2, 1, 1, 1])
+        with algo_cols[0]:
+            algorithms = st.multiselect("Algoritma", ["DE", "PSO", "SA"], default=["DE", "PSO"])
+        with algo_cols[1]:
+            pop_size = st.slider("Populasi", min_value=30, max_value=200, value=80, step=10)
+        with algo_cols[2]:
+            max_iter = st.slider("Iterasi", min_value=50, max_value=500, value=150, step=25)
+        with algo_cols[3]:
+            seed = st.number_input("Seed optimizer", min_value=1, max_value=9999, value=42)
+
+    valid_df = valuation_df[valuation_df["Error"].isna()].copy()
+    tickers, val_data, candidate_df = optimizer.load_valuation_dataframe(
+        valid_df,
+        status_filter=candidate_filter,
+        top_n=25,
+    )
+
+    st.caption(f"Kandidat optimizer: {len(tickers)} saham")
+    st.dataframe(candidate_df, use_container_width=True, hide_index=True)
+
+    if run_optimizer:
+        if not algorithms:
+            st.warning("Pilih minimal satu algoritma.")
+        elif len(tickers) < optimizer.PORTFOLIO_SIZE:
+            st.warning(f"Butuh minimal {optimizer.PORTFOLIO_SIZE} kandidat, saat ini hanya {len(tickers)}.")
+        else:
+            random.seed(int(seed))
+            np.random.seed(int(seed))
+            with st.spinner("Mengambil histori harga kandidat..."):
+                stocks = collect_stock_history(tickers, val_data, hist_period)
+
+            if len(stocks) < optimizer.PORTFOLIO_SIZE:
+                st.warning(f"Histori harga valid hanya {len(stocks)} saham. Perlu minimal {optimizer.PORTFOLIO_SIZE}.")
             else:
-                random.seed(int(seed))
-                np.random.seed(int(seed))
-                with st.spinner("Mengambil histori harga kandidat..."):
-                    stocks = collect_stock_history(tickers, val_data, hist_period)
+                with st.spinner("Menjalankan optimizer portofolio..."):
+                    engine = optimizer.PortfolioEngine(stocks, profile)
+                    results = optimizer.run_ensemble(
+                        engine,
+                        profile,
+                        verbose=False,
+                        algorithms=algorithms,
+                        pop_size=int(pop_size),
+                        max_iter=int(max_iter),
+                    )
+                st.session_state["portfolio_results"] = results
 
-                if len(stocks) < optimizer.PORTFOLIO_SIZE:
-                    st.warning(f"Histori harga valid hanya {len(stocks)} saham. Perlu minimal {optimizer.PORTFOLIO_SIZE}.")
-                else:
-                    with st.spinner("Menjalankan optimizer portofolio..."):
-                        engine = optimizer.PortfolioEngine(stocks, profile)
-                        results = optimizer.run_ensemble(
-                            engine,
-                            profile,
-                            verbose=False,
-                            algorithms=algorithms,
-                            pop_size=int(pop_size),
-                            max_iter=int(max_iter),
-                        )
-                    st.session_state["portfolio_results"] = results
+    portfolio_results = st.session_state.get("portfolio_results")
+    if portfolio_results:
+        best = optimizer.best_portfolio_result(portfolio_results)
+        if best is not None:
+            show_portfolio(best, portfolio_results, float(capital))
 
-        portfolio_results = st.session_state.get("portfolio_results")
-        if portfolio_results:
-            best = optimizer.best_portfolio_result(portfolio_results)
-            if best is not None:
-                show_portfolio(best, portfolio_results, float(capital))
+
+def render_sidebar():
+    valuation_df = st.session_state.get("valuation_df", pd.DataFrame())
+    cached_portfolio = st.session_state.get("portfolio_results")
+    has_extraction = not valuation_df.empty
+    target_page = analysis_page_name()
+
+    if not has_extraction and st.session_state.get("active_page") != "Ekstraksi Data":
+        st.session_state["active_page"] = "Ekstraksi Data"
+
+    with st.sidebar:
+        st.header("Navigasi")
+
+        extraction_label = "[Aktif] Ekstraksi Data" if st.session_state.get("active_page") == "Ekstraksi Data" else "Ekstraksi Data"
+        if st.button(extraction_label, use_container_width=True, key="nav_extraction"):
+            st.session_state["active_page"] = "Ekstraksi Data"
+            st.rerun()
+
+        analysis_label = f"[Aktif] {target_page}" if st.session_state.get("active_page") == target_page else target_page
+        if st.button(analysis_label, use_container_width=True, disabled=not has_extraction, key="nav_analysis"):
+            st.session_state["active_page"] = target_page
+            st.rerun()
+
+        st.divider()
+        st.header("Status")
+        st.metric("Hasil ekstraksi", 0 if valuation_df.empty else len(valuation_df))
+        st.metric("Hasil optimasi", 0 if not cached_portfolio else len(cached_portfolio))
+
+        config = st.session_state.get("extraction_config")
+        if config:
+            st.caption(f"Terakhir: {config['analysis_type']} | {config['ticker_count']} ticker | {config['extracted_at']}")
+
+        st.divider()
+        if st.button("Clear cache data", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.pop("valuation_df", None)
+            st.session_state.pop("portfolio_results", None)
+            st.session_state.pop("extraction_config", None)
+            st.session_state["active_page"] = "Ekstraksi Data"
+            st.rerun()
+
+
+def main():
+    st.session_state.setdefault("active_page", "Ekstraksi Data")
+    st.session_state.setdefault("analysis_type", "Individual")
+    st.session_state.setdefault("data_scope", "Saham tunggal")
+    st.session_state.setdefault("hist_period", "1y")
+
+    st.title("SahamDiskon")
+    st.caption("Valuasi fundamental dan optimasi portofolio IDX dalam satu alur.")
+
+    render_sidebar()
+
+    active_page = st.session_state.get("active_page", "Ekstraksi Data")
+    if active_page == "Analisis Individual":
+        show_individual_page()
+    elif active_page == "Analisis Portofolio":
+        show_portfolio_page()
+    else:
+        show_extraction_page()
+
+
+main()
